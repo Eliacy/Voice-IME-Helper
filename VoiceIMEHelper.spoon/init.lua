@@ -130,11 +130,14 @@ end
 -- State machine: IDLE | CHECKING | MONITORING
 local state = "IDLE"
 
--- lastSourceID: the most recently known input source ID (updated on each change)
-local lastSourceID = nil
+-- appLastSourceID: per-app table mapping bundleID -> last used input source ID
+local appLastSourceID = {}
 
 -- previousSourceID: the input source we want to restore to (saved when voice IME starts)
 local previousSourceID = nil
+
+-- restoreBundleID: the bundle ID of the app to restore the input method for
+local restoreBundleID = nil
 
 -- micDevice: the audio input device being watched
 local micDevice = nil
@@ -155,6 +158,30 @@ local pendingCheckTimer = nil
 -- ============================================================================
 -- Internal Functions
 -- ============================================================================
+
+--- Returns the bundle ID of the current frontmost application.
+local function getCurrentAppBundleID()
+    local app = hs.application.frontmostApplication()
+    if app then
+        return app:bundleID()
+    end
+    return nil
+end
+
+--- Gets the last known input source ID for the given bundle ID.
+local function getAppLastSourceID(bundleID)
+    if bundleID then
+        return appLastSourceID[bundleID]
+    end
+    return nil
+end
+
+--- Sets the last known input source ID for the given bundle ID.
+local function setAppLastSourceID(bundleID, sourceID)
+    if bundleID then
+        appLastSourceID[bundleID] = sourceID
+    end
+end
 
 --- Stops all mic monitoring and returns to IDLE state.
 local function stopMicMonitoring()
@@ -186,6 +213,10 @@ local function switchBackToPreviousIME()
         local ok = hs.keycodes.currentSourceID(previousSourceID)
         if ok then
             logger.i("Successfully switched back to: " .. previousSourceID)
+            -- Update per-app tracking for the restored app
+            if restoreBundleID then
+                setAppLastSourceID(restoreBundleID, previousSourceID)
+            end
         else
             logger.e("Failed to switch back to: " .. previousSourceID)
         end
@@ -406,8 +437,14 @@ end
 ---  * The VoiceIMEHelper object
 function obj:init()
     initLogger()
-    lastSourceID = hs.keycodes.currentSourceID()
-    logger.i("Initialized. Current input source: " .. tostring(lastSourceID))
+    local bundleID = getCurrentAppBundleID()
+    local currentSource = hs.keycodes.currentSourceID()
+    if bundleID then
+        setAppLastSourceID(bundleID, currentSource)
+        logger.i("Initialized. Current app: " .. bundleID .. ", input source: " .. tostring(currentSource))
+    else
+        logger.i("Initialized. Current input source: " .. tostring(currentSource))
+    end
     return self
 end
 
@@ -428,17 +465,25 @@ function obj:start()
     -- Ensure we start fresh
     self:stop()
 
-    lastSourceID = hs.keycodes.currentSourceID()
-    logger.i("Starting with current input source: " .. tostring(lastSourceID))
+    local bundleID = getCurrentAppBundleID()
+    local currentSource = hs.keycodes.currentSourceID()
+    if bundleID then
+        setAppLastSourceID(bundleID, currentSource)
+        logger.i("Starting. Current app: " .. bundleID .. ", input source: " .. tostring(currentSource))
+    else
+        logger.i("Starting. Current input source: " .. tostring(currentSource))
+    end
 
     hs.keycodes.inputSourceChanged(function()
         local newSourceID = hs.keycodes.currentSourceID()
         local newMethodName = hs.keycodes.currentMethod() or "Unknown"
-        logger.i("Input source changed: " .. tostring(lastSourceID) .. " -> " .. tostring(newSourceID) .. " (" .. newMethodName .. ")")
+        local currentBundleID = getCurrentAppBundleID()
+        local appLastSource = getAppLastSourceID(currentBundleID)
+        logger.i("Input source changed (app: " .. tostring(currentBundleID) .. "): " .. tostring(appLastSource) .. " -> " .. tostring(newSourceID) .. " (" .. newMethodName .. ")")
 
-        -- Skip if no actual change
-        if newSourceID == lastSourceID then
-            logger.d("No actual change, ignoring")
+        -- Skip if no actual change for this app
+        if newSourceID == appLastSource then
+            logger.d("No actual change for this app, ignoring")
             return
         end
 
@@ -478,20 +523,22 @@ function obj:start()
             end
             if not matches then
                 logger.i("Input method '" .. currentMethod .. "' does not match voice IME patterns, treating as regular IME")
-                -- For non-voice IMEs, update both lastSourceID and previousSourceID
+                -- For non-voice IMEs, update per-app last source and previous source
                 -- so this becomes the restore target when switching back from a voice IME
-                lastSourceID = newSourceID
+                setAppLastSourceID(currentBundleID, newSourceID)
                 previousSourceID = newSourceID
+                restoreBundleID = currentBundleID
                 return
             end
         end
 
-        -- Save the source we want to restore to (the one before this potential voice IME)
-        previousSourceID = lastSourceID
-        lastSourceID = newSourceID
+        -- Save the source we want to restore to (the app's last input method before this voice IME)
+        previousSourceID = appLastSource
+        restoreBundleID = currentBundleID
+        setAppLastSourceID(currentBundleID, newSourceID)
 
         logger.i("New potential voice IME detected: " .. newMethodName)
-        logger.d("  Will restore to: " .. tostring(previousSourceID))
+        logger.d("  Will restore to: " .. tostring(previousSourceID) .. " for app: " .. tostring(currentBundleID))
         logger.i("Will check mic status after " .. obj.checkDelay .. "s delay")
 
         -- After a delay, start checking mic status
