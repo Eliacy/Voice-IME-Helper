@@ -1,0 +1,126 @@
+[
+  {
+    "doc": "Automatically switches back to the previous input method after voice IME usage.\n\nThis Spoon monitors input source changes and microphone usage to detect when\na voice input method (e.g., Doubao/豆包语音输入) is activated. When the\nmicrophone transitions from \"in use\" to \"not in use\", it automatically\nswitches back to the previously used input method.\n\n### Usage\n\nAdd the following to your `~/.hammerspoon/init.lua`:\n\n```lua\nhs.loadSpoon(\"VoiceIMEHelper\")\nspoon.VoiceIMEHelper:start()\n```\n\n### How it works\n\n1. Monitors system input source changes\n2. When a change is detected, records the previous input method and starts\n   checking microphone status (with a configurable delay)\n3. If the microphone transitions from \"not in use\" to \"in use\", it assumes\n   a voice IME has been activated\n4. Continues monitoring the microphone; when it transitions from \"in use\"\n   to \"not in use\", automatically switches back to the previous input method\n\n### Configuration\n\nAdjust these properties before calling `:start()`:\n\n```lua\nspoon.VoiceIMEHelper.checkDelay = 0.5    -- Delay before checking mic (seconds)\nspoon.VoiceIMEHelper.checkInterval = 0.3  -- Polling interval (seconds)\nspoon.VoiceIMEHelper.checkTimeout = 3.0   -- Timeout for mic detection (seconds)\nspoon.VoiceIMEHelper.restoreDelay = 1.0   -- Delay before switching back (seconds)\n```",
+    "name": "VoiceIMEHelper",
+    "type": "Module"
+  },
+  {
+    "doc": "The name of the Spoon.",
+    "name": "VoiceIMEHelper.name",
+    "type": "Variable"
+  },
+  {
+    "doc": "The version of the Spoon.",
+    "name": "VoiceIMEHelper.version",
+    "type": "Variable"
+  },
+  {
+    "doc": "The author of the Spoon.",
+    "name": "VoiceIMEHelper.author",
+    "type": "Variable"
+  },
+  {
+    "doc": "The license of the Spoon.",
+    "name": "VoiceIMEHelper.license",
+    "type": "Variable"
+  },
+  {
+    "doc": "The homepage of the Spoon.",
+    "name": "VoiceIMEHelper.homepage",
+    "type": "Variable"
+  },
+  {
+    "doc": "Delay in seconds after input source change before checking microphone status.\nThis gives the voice IME time to start using the microphone.\nDefault: `0.5`",
+    "name": "VoiceIMEHelper.checkDelay",
+    "type": "Variable"
+  },
+  {
+    "doc": "Interval in seconds for polling microphone status during the checking phase.\nUsed as a backup mechanism alongside the audio device watcher.\nDefault: `0.3`",
+    "name": "VoiceIMEHelper.checkInterval",
+    "type": "Variable"
+  },
+  {
+    "doc": "Maximum time in seconds to wait for microphone to become \"in use\" after\nan input source change. If exceeded, monitoring is cancelled and the\nSpoon returns to the idle state.\nDefault: `3.0`",
+    "name": "VoiceIMEHelper.checkTimeout",
+    "type": "Variable"
+  },
+  {
+    "doc": "Delay in seconds after microphone becomes \"not in use\" before actually\nswitching back to the previous input method. This prevents premature\nswitching if the voice IME briefly releases the microphone between\nspeech segments.\nDefault: `1.0`",
+    "name": "VoiceIMEHelper.restoreDelay",
+    "type": "Variable"
+  },
+  {
+    "doc": "Optional list of Lua patterns to match against input method names.\nIf set, the Spoon will only activate monitoring when the new input\nmethod's name matches one of these patterns.\nSet to `nil` (default) to monitor all input method changes.\n\nExample:\n```lua\nspoon.VoiceIMEHelper.voiceIMEPatterns = {\"语音\", \"Voice\", \"Dictation\", \"Doubao\"}\n```",
+    "name": "VoiceIMEHelper.voiceIMEPatterns",
+    "type": "Variable"
+  },
+  {
+    "doc": "Logging level for the Spoon. Set to `\"debug\"` for verbose logging,\n`\"info\"` for normal operation, or `\"warning\"` to suppress most messages.\nDefault: `\"info\"`",
+    "name": "VoiceIMEHelper.logLevel",
+    "type": "Variable"
+  },
+  {
+    "doc": "Initializes the Spoon. Called automatically by `hs.loadSpoon()`.\n\nYou generally do not need to call this manually.",
+    "name": "VoiceIMEHelper:init",
+    "type": "Method",
+    "parameters": ["None"],
+    "returns": ["The VoiceIMEHelper object"],
+    "signature": "VoiceIMEHelper:init()"
+  },
+  {
+    "doc": "Starts monitoring for input source changes and microphone usage.\n\nThis registers a callback for `hs.keycodes.inputSourceChanged`. Note that\nonly one callback can be registered at a time; if you have other Spoons or\ncode using this callback, they may conflict.",
+    "name": "VoiceIMEHelper:start",
+    "type": "Method",
+    "parameters": ["None"],
+    "returns": ["The VoiceIMEHelper object"],
+    "signature": "VoiceIMEHelper:start()"
+  },
+  {
+    "doc": "Stops all monitoring and cleans up resources.",
+    "name": "VoiceIMEHelper:stop",
+    "type": "Method",
+    "parameters": ["None"],
+    "returns": ["The VoiceIMEHelper object"],
+    "signature": "VoiceIMEHelper:stop()"
+  },
+  {
+    "doc": "Returns the current state of the Spoon.",
+    "name": "VoiceIMEHelper:getState",
+    "type": "Method",
+    "parameters": ["None"],
+    "returns": ["A string: `\"IDLE\"`, `\"CHECKING\"`, or `\"MONITORING\"`"],
+    "signature": "VoiceIMEHelper:getState()"
+  },
+  {
+    "doc": "Returns the saved previous input source ID (the one to switch back to).",
+    "name": "VoiceIMEHelper:getPreviousSourceID",
+    "type": "Method",
+    "parameters": ["None"],
+    "returns": ["A string containing the previous input source ID, or `nil` if none saved"],
+    "signature": "VoiceIMEHelper:getPreviousSourceID()"
+  },
+  {
+    "doc": "Manually triggers a restore to the previously saved input method.\nThis is useful for testing or for binding to a hotkey.",
+    "name": "VoiceIMEHelper:triggerManualRestore",
+    "type": "Method",
+    "parameters": ["None"],
+    "returns": ["The VoiceIMEHelper object"],
+    "signature": "VoiceIMEHelper:triggerManualRestore()"
+  },
+  {
+    "doc": "Sets the logging level for the Spoon.",
+    "name": "VoiceIMEHelper:setLogLevel",
+    "type": "Method",
+    "parameters": ["level - A string: `\"debug\"`, `\"info\"`, `\"warning\"`, or `\"error\"`"],
+    "returns": ["The VoiceIMEHelper object"],
+    "signature": "VoiceIMEHelper:setLogLevel(level)"
+  },
+  {
+    "doc": "Binds hotkeys for VoiceIMEHelper actions.\n\nSupported actions:\n* `restore` - Manually trigger a restore to the previous IME\n\nExample:\n```lua\nspoon.VoiceIMEHelper:bindHotkeys({\n    restore = {{\"cmd\", \"shift\"}, \"r\"}\n})\n```",
+    "name": "VoiceIMEHelper:bindHotkeys",
+    "type": "Method",
+    "parameters": ["mapping - A table containing hotkey mappings"],
+    "returns": ["The VoiceIMEHelper object"],
+    "signature": "VoiceIMEHelper:bindHotkeys(mapping)"
+  }
+]
