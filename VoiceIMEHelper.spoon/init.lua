@@ -107,7 +107,7 @@ obj.restoreDelay = 1.0
 ---
 --- Example:
 --- ```lua
---- spoon.VoiceIMEHelper.voiceIMEPatterns = {"语音", "Voice", "Dictation", "Doubao"}
+--- spoon.VoiceIMEHelper.voiceIMEPatterns = {"语音", "Voice", "Dictation", "Doubao", "豆包"}
 --- ```
 obj.voiceIMEPatterns = nil
 
@@ -147,6 +147,9 @@ local checkStartTime = nil
 
 -- restoreTimer: timer for delayed restore after mic becomes "not in use"
 local restoreTimer = nil
+
+-- pendingCheckTimer: timer for the delayed start of the CHECKING phase
+local pendingCheckTimer = nil
 
 
 -- ============================================================================
@@ -255,7 +258,8 @@ local function transitionToMonitoring()
         checkTimer = nil
     end
 
-    logger.i("Transitioning to MONITORING state (waiting for mic to become idle)")
+    local currentMethod = hs.keycodes.currentMethod() or "Unknown"
+    logger.i("Voice IME confirmed: " .. currentMethod .. ". Monitoring for completion.")
 
     -- Set up the watcher for monitoring
     setupWatcherForMonitoring()
@@ -429,7 +433,8 @@ function obj:start()
 
     hs.keycodes.inputSourceChanged(function()
         local newSourceID = hs.keycodes.currentSourceID()
-        logger.d("Input source changed: " .. tostring(lastSourceID) .. " -> " .. tostring(newSourceID))
+        local newMethodName = hs.keycodes.currentMethod() or "Unknown"
+        logger.i("Input source changed: " .. tostring(lastSourceID) .. " -> " .. tostring(newSourceID) .. " (" .. newMethodName .. ")")
 
         -- Skip if no actual change
         if newSourceID == lastSourceID then
@@ -437,48 +442,61 @@ function obj:start()
             return
         end
 
-        -- If we're in CHECKING or MONITORING state
+        -- Skip if the new input method name is empty or 'Unknown'
+        -- (Doubao voice IME briefly switches to such a placeholder before voice input starts)
+        if newMethodName == "" or newMethodName == "Unknown" then
+            logger.d("New input method name is empty or 'Unknown', ignoring")
+            return
+        end
+
+        -- If we're in CHECKING or MONITORING state, cancel current monitoring
         if state ~= "IDLE" then
-            -- If user switched back to the previous IME manually, stop monitoring
-            if newSourceID == previousSourceID then
-                logger.i("User manually switched back to previous IME, stopping monitoring")
-                stopMicMonitoring()
-                lastSourceID = newSourceID
-                return
-            else
-                -- User switched to a different IME, reset and start fresh
-                logger.d("Input source changed during monitoring, resetting")
-                stopMicMonitoring()
-            end
+            logger.d("Cancelling current monitoring due to new input source change")
+            stopMicMonitoring()
+            -- Note: We don't handle the manual switch-back case here anymore
+            -- because we always want to start fresh monitoring for the new source
+        end
+
+        -- Cancel any pending delayed check from a previous input source change
+        if pendingCheckTimer then
+            pendingCheckTimer:stop()
+            pendingCheckTimer = nil
         end
 
         -- Check if we should filter by IME name
+        local shouldMonitor = true
         if obj.voiceIMEPatterns and #obj.voiceIMEPatterns > 0 then
             local currentMethod = hs.keycodes.currentMethod() or ""
+            local currentMethodLower = string.lower(currentMethod)
             local matches = false
             for _, pattern in ipairs(obj.voiceIMEPatterns) do
-                if string.find(currentMethod, pattern) then
+                if string.find(currentMethodLower, string.lower(pattern)) then
                     matches = true
                     logger.d("Input method name '" .. currentMethod .. "' matches pattern '" .. pattern .. "'")
                     break
                 end
             end
             if not matches then
-                logger.d("Input method '" .. currentMethod .. "' does not match any voice IME patterns, skipping")
+                logger.i("Input method '" .. currentMethod .. "' does not match voice IME patterns, treating as regular IME")
+                -- For non-voice IMEs, update both lastSourceID and previousSourceID
+                -- so this becomes the restore target when switching back from a voice IME
                 lastSourceID = newSourceID
+                previousSourceID = newSourceID
                 return
             end
         end
 
-        -- Save the source we want to restore to
+        -- Save the source we want to restore to (the one before this potential voice IME)
         previousSourceID = lastSourceID
         lastSourceID = newSourceID
 
-        logger.i("New IME detected. Previous IME saved: " .. tostring(previousSourceID))
+        logger.i("New potential voice IME detected: " .. newMethodName)
+        logger.d("  Will restore to: " .. tostring(previousSourceID))
         logger.i("Will check mic status after " .. obj.checkDelay .. "s delay")
 
         -- After a delay, start checking mic status
-        hs.timer.doAfter(obj.checkDelay, function()
+        pendingCheckTimer = hs.timer.doAfter(obj.checkDelay, function()
+            pendingCheckTimer = nil
             startCheckingMic()
         end)
     end)
@@ -499,6 +517,12 @@ end
 function obj:stop()
     -- Unregister input source change callback
     hs.keycodes.inputSourceChanged(nil)
+
+    -- Cancel any pending delayed check
+    if pendingCheckTimer then
+        pendingCheckTimer:stop()
+        pendingCheckTimer = nil
+    end
 
     -- Stop any mic monitoring
     stopMicMonitoring()
