@@ -509,7 +509,6 @@ function obj:start()
         end
 
         -- Check if we should filter by IME name
-        local shouldMonitor = true
         if obj.voiceIMEPatterns and #obj.voiceIMEPatterns > 0 then
             local currentMethod = hs.keycodes.currentMethod() or ""
             local currentMethodLower = string.lower(currentMethod)

@@ -2,7 +2,7 @@
 
 Hammerspoon Spoon 插件：在语音输入法使用完成后，自动切换回原先的输入法。
 
-本插件的最原始想法，参考自：https://github.com/Paxxs/Doubao-ime-hammerspoon
+本插件的最原始想法，参考自：<https://github.com/Paxxs/Doubao-ime-hammerspoon>
 
 ## 功能
 
@@ -18,7 +18,7 @@ Hammerspoon Spoon 插件：在语音输入法使用完成后，自动切换回�
 
 ## 安装
 
-需要预先在 http://www.hammerspoon.org/ 下载和安装 Hammerspoon，然后按后续的步骤安装和配置 `VoiceIMEHelper.spoon` 插件。
+需要预先在 <http://www.hammerspoon.org/> 下载和安装 Hammerspoon，然后按后续的步骤安装和配置 `VoiceIMEHelper.spoon` 插件。
 
 ### 方法一：直接复制
 
