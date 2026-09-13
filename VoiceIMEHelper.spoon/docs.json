@@ -1,6 +1,6 @@
 [
   {
-    "doc": "Automatically switches back to the previous input method after voice IME usage.\n\nThis Spoon monitors input source changes and microphone usage to detect when\na voice input method (e.g., Doubao/豆包语音输入) is activated. When the\nmicrophone transitions from \"in use\" to \"not in use\", it automatically\nswitches back to the previously used input method.\n\n### Usage\n\nAdd the following to your `~/.hammerspoon/init.lua`:\n\n```lua\nhs.loadSpoon(\"VoiceIMEHelper\")\nspoon.VoiceIMEHelper:start()\n```\n\n### How it works\n\n1. Monitors system input source changes\n2. When a change is detected, records the previous input method and starts\n   checking microphone status (with a configurable delay)\n3. If the microphone transitions from \"not in use\" to \"in use\", it assumes\n   a voice IME has been activated\n4. Continues monitoring the microphone; when it transitions from \"in use\"\n   to \"not in use\", automatically switches back to the previous input method\n\n### Configuration\n\nAdjust these properties before calling `:start()`:\n\n```lua\nspoon.VoiceIMEHelper.checkDelay = 0.5    -- Delay before checking mic (seconds)\nspoon.VoiceIMEHelper.checkInterval = 0.3  -- Polling interval (seconds)\nspoon.VoiceIMEHelper.checkTimeout = 3.0   -- Timeout for mic detection (seconds)\nspoon.VoiceIMEHelper.restoreDelay = 1.0   -- Delay before switching back (seconds)\n```",
+    "doc": "Automatically switches back to the previous input method after voice IME usage.\n\nThis Spoon monitors input source changes and microphone usage to detect when\na voice input method (e.g., Doubao/豆包语音输入) is activated. When the\nmicrophone transitions from \"in use\" to \"not in use\", it automatically\nswitches back to the previously used input method.\n\n### Usage\n\nAdd the following to your `~/.hammerspoon/init.lua`:\n\n```lua\nhs.loadSpoon(\"VoiceIMEHelper\")\nspoon.VoiceIMEHelper:start()\n```\n\n### How it works\n\n1. Monitors system input source changes\n2. When a change is detected, records the previous input method and starts\n   checking microphone status (with a configurable delay)\n3. If the microphone transitions from \"not in use\" to \"in use\", it assumes\n   a voice IME has been activated\n4. Continues monitoring the microphone; when it transitions from \"in use\"\n   to \"not in use\", waits for the voice IME to finish committing its text\n   and then switches back to the previous input method\n\n### Waiting for the IME to finish committing\n\nReleasing the microphone does not mean the voice IME is finished: it may\nstill be turning the recording into text. Switching the input method while\nthat text is still being committed can discard the part that has not been\ncommitted yet, which is what this wait prevents.\n\nBefore switching back, the Spoon reads the focused text view's\n`AXTextInputMarkedRange` accessibility attribute, which reports the IME's\nuncommitted (marked/pre-edit) text, i.e. candidates waiting to be committed:\n\n* readable and `length > 0` - the IME is still committing; keep waiting (up\n  to `commitWaitTimeout` seconds), then switch anyway with a warning\n* readable and `length == 0` - nothing pending; switch back immediately\n* unreadable (the application does not expose the attribute, or Hammerspoon\n  has no Accessibility permission) - the state cannot be verified, so wait\n  `commitUnreadableDelay` seconds (longer than `restoreDelay`) before\n  switching, and log a warning that names the reason\n\n### Configuration\n\nAdjust these properties before calling `:start()`:\n\n```lua\nspoon.VoiceIMEHelper.checkDelay = 0.5          -- Delay before checking mic (seconds)\nspoon.VoiceIMEHelper.checkInterval = 0.3       -- Polling interval (seconds)\nspoon.VoiceIMEHelper.checkTimeout = 3.0        -- Timeout for mic detection (seconds)\nspoon.VoiceIMEHelper.restoreDelay = 1.0        -- Delay before switching back (seconds)\nspoon.VoiceIMEHelper.waitForCommit = true      -- Wait for IME text to be committed\nspoon.VoiceIMEHelper.commitCheckInterval = 0.3 -- Re-check interval while committing\nspoon.VoiceIMEHelper.commitWaitTimeout = 120   -- Max seconds to wait while committing\nspoon.VoiceIMEHelper.commitUnreadableDelay = 7 -- Seconds to wait when unreadable\n```",
     "name": "VoiceIMEHelper",
     "type": "Module"
   },
@@ -50,6 +50,26 @@
     "type": "Variable"
   },
   {
+    "doc": "Whether to wait for the voice IME to finish committing its text before\nswitching back. While the focused text view still holds uncommitted\n(marked/pre-edit) text, switching the input method can discard it.\nDefault: `true`",
+    "name": "VoiceIMEHelper.waitForCommit",
+    "type": "Variable"
+  },
+  {
+    "doc": "Interval in seconds for re-reading the IME's marked text range while\nwaiting for the text to be committed.\nDefault: `0.3`",
+    "name": "VoiceIMEHelper.commitCheckInterval",
+    "type": "Variable"
+  },
+  {
+    "doc": "Maximum time in seconds to keep waiting while the IME still holds\nuncommitted marked text. When exceeded, the input method is switched back\nanyway and a warning is logged.\nDefault: `120`",
+    "name": "VoiceIMEHelper.commitWaitTimeout",
+    "type": "Variable"
+  },
+  {
+    "doc": "Seconds to wait before switching back when the marked text range cannot be\nread at all (the application does not expose `AXTextInputMarkedRange`, or\nHammerspoon lacks Accessibility permission). Deliberately longer than\n`restoreDelay`, because an unreadable state may still mean the IME is\ncommitting; a warning naming the reason is logged.\nDefault: `7`",
+    "name": "VoiceIMEHelper.commitUnreadableDelay",
+    "type": "Variable"
+  },
+  {
     "doc": "Optional list of Lua patterns to match against input method names.\nIf set, the Spoon will only activate monitoring when the new input\nmethod's name matches one of these patterns.\nSet to `nil` (default) to monitor all input method changes.\n\nExample:\n```lua\nspoon.VoiceIMEHelper.voiceIMEPatterns = {\"语音\", \"Voice\", \"Dictation\", \"Doubao\"}\n```",
     "name": "VoiceIMEHelper.voiceIMEPatterns",
     "type": "Variable"
@@ -68,7 +88,7 @@
     "signature": "VoiceIMEHelper:init()"
   },
   {
-    "doc": "Starts monitoring for input source changes and microphone usage.\n\nThis registers a callback for `hs.keycodes.inputSourceChanged`. Note that\nonly one callback can be registered at a time; if you have other Spoons or\ncode using this callback, they may conflict.",
+    "doc": "Starts monitoring for input source changes and microphone usage.\n\nThis registers a callback for `hs.keycodes.inputSourceChanged`. Note that\nonly one callback can be registered at a time; if you have other Spoons or\ncode using this callback, they may conflict.\n\nThe commit wait before switching back reads accessibility attributes, so\nHammerspoon needs the Accessibility permission (System Settings > Privacy\n& Security > Accessibility > Hammerspoon). Without it that state cannot be\nverified, and the Spoon falls back to `commitUnreadableDelay` with a\nwarning in the log.\n\nParameters:\n * None\n\nReturns:\n * The VoiceIMEHelper object",
     "name": "VoiceIMEHelper:start",
     "type": "Method",
     "parameters": ["None"],
@@ -100,7 +120,7 @@
     "signature": "VoiceIMEHelper:getPreviousSourceID()"
   },
   {
-    "doc": "Manually triggers a restore to the previously saved input method.\nThis is useful for testing or for binding to a hotkey.",
+    "doc": "Manually triggers a restore to the previously saved input method.\nThis is useful for testing or for binding to a hotkey.\n\nUnlike the automatic restore, this switches immediately: it does not wait\nfor the voice IME to finish committing its text, because the user is\nexplicitly asking for the switch now.\n\nParameters:\n * None\n\nReturns:\n * The VoiceIMEHelper object",
     "name": "VoiceIMEHelper:triggerManualRestore",
     "type": "Method",
     "parameters": ["None"],

@@ -24,17 +24,41 @@
 --- 3. If the microphone transitions from "not in use" to "in use", it assumes
 ---    a voice IME has been activated
 --- 4. Continues monitoring the microphone; when it transitions from "in use"
----    to "not in use", automatically switches back to the previous input method
+---    to "not in use", waits for the voice IME to finish committing its text
+---    and then switches back to the previous input method
+---
+--- ### Waiting for the IME to finish committing
+---
+--- Releasing the microphone does not mean the voice IME is finished: it may
+--- still be turning the recording into text. Switching the input method while
+--- that text is still being committed can discard the part that has not been
+--- committed yet, which is what this wait prevents.
+---
+--- Before switching back, the Spoon reads the focused text view's
+--- `AXTextInputMarkedRange` accessibility attribute, which reports the IME's
+--- uncommitted (marked/pre-edit) text, i.e. candidates waiting to be committed:
+---
+--- * readable and `length > 0` - the IME is still committing; keep waiting (up
+---   to `commitWaitTimeout` seconds), then switch anyway with a warning
+--- * readable and `length == 0` - nothing pending; switch back immediately
+--- * unreadable (the application does not expose the attribute, or Hammerspoon
+---   has no Accessibility permission) - the state cannot be verified, so wait
+---   `commitUnreadableDelay` seconds (longer than `restoreDelay`) before
+---   switching, and log a warning that names the reason
 ---
 --- ### Configuration
 ---
 --- Adjust these properties before calling `:start()`:
 ---
 --- ```lua
---- spoon.VoiceIMEHelper.checkDelay = 0.5    -- Delay before checking mic (seconds)
---- spoon.VoiceIMEHelper.checkInterval = 0.3  -- Polling interval (seconds)
---- spoon.VoiceIMEHelper.checkTimeout = 3.0   -- Timeout for mic detection (seconds)
---- spoon.VoiceIMEHelper.restoreDelay = 1.0   -- Delay before switching back (seconds)
+--- spoon.VoiceIMEHelper.checkDelay = 0.5          -- Delay before checking mic (seconds)
+--- spoon.VoiceIMEHelper.checkInterval = 0.3       -- Polling interval (seconds)
+--- spoon.VoiceIMEHelper.checkTimeout = 3.0        -- Timeout for mic detection (seconds)
+--- spoon.VoiceIMEHelper.restoreDelay = 1.0        -- Delay before switching back (seconds)
+--- spoon.VoiceIMEHelper.waitForCommit = true      -- Wait for IME text to be committed
+--- spoon.VoiceIMEHelper.commitCheckInterval = 0.3 -- Re-check interval while committing
+--- spoon.VoiceIMEHelper.commitWaitTimeout = 120   -- Max seconds to wait while committing
+--- spoon.VoiceIMEHelper.commitUnreadableDelay = 7 -- Seconds to wait when unreadable
 --- ```
 
 local obj = {}
@@ -49,7 +73,7 @@ obj.name = "VoiceIMEHelper"
 --- VoiceIMEHelper.version
 --- Variable
 --- The version of the Spoon.
-obj.version = "1.0.0"
+obj.version = "1.1.0"
 
 --- VoiceIMEHelper.author
 --- Variable
@@ -97,6 +121,39 @@ obj.checkTimeout = 3.0
 --- speech segments.
 --- Default: `1.0`
 obj.restoreDelay = 1.0
+
+--- VoiceIMEHelper.waitForCommit
+--- Variable
+--- Whether to wait for the voice IME to finish committing its text before
+--- switching back. While the focused text view still holds uncommitted
+--- (marked/pre-edit) text, switching the input method can discard it.
+--- Default: `true`
+obj.waitForCommit = true
+
+--- VoiceIMEHelper.commitCheckInterval
+--- Variable
+--- Interval in seconds for re-reading the IME's marked text range while
+--- waiting for the text to be committed.
+--- Default: `0.3`
+obj.commitCheckInterval = 0.3
+
+--- VoiceIMEHelper.commitWaitTimeout
+--- Variable
+--- Maximum time in seconds to keep waiting while the IME still holds
+--- uncommitted marked text. When exceeded, the input method is switched back
+--- anyway and a warning is logged.
+--- Default: `120`
+obj.commitWaitTimeout = 120
+
+--- VoiceIMEHelper.commitUnreadableDelay
+--- Variable
+--- Seconds to wait before switching back when the marked text range cannot be
+--- read at all (the application does not expose `AXTextInputMarkedRange`, or
+--- Hammerspoon lacks Accessibility permission). Deliberately longer than
+--- `restoreDelay`, because an unreadable state may still mean the IME is
+--- committing; a warning naming the reason is logged.
+--- Default: `7`
+obj.commitUnreadableDelay = 7
 
 --- VoiceIMEHelper.voiceIMEPatterns
 --- Variable
@@ -151,6 +208,16 @@ local checkStartTime = nil
 -- restoreTimer: timer for delayed restore after mic becomes "not in use"
 local restoreTimer = nil
 
+-- commitTimer: timer for re-checking the IME's marked text while waiting for it
+-- to be committed, and for the delay used when that state cannot be read
+local commitTimer = nil
+
+-- commitWaitStart: timestamp when waiting for the IME to finish committing began
+local commitWaitStart = nil
+
+-- commitWaitLogged: whether the "still committing" wait has been logged yet
+local commitWaitLogged = false
+
 -- pendingCheckTimer: timer for the delayed start of the CHECKING phase
 local pendingCheckTimer = nil
 
@@ -197,6 +264,13 @@ local function stopMicMonitoring()
         restoreTimer = nil
     end
 
+    if commitTimer then
+        commitTimer:stop()
+        commitTimer = nil
+    end
+    commitWaitStart = nil
+    commitWaitLogged = false
+
     if micDevice then
         micDevice:watcherStop()
         micDevice:watcherCallback(nil)
@@ -225,6 +299,133 @@ local function switchBackToPreviousIME()
     end
 end
 
+--- Reads how much uncommitted (marked/pre-edit) text the current IME is
+--- holding in the focused text view.
+---
+--- Returns:
+---  * the marked range length, `0` when the IME has nothing pending, or
+---  * `nil` plus a string describing why the state could not be read
+local function readMarkedRangeLength()
+    if not hs.axuielement then
+        return nil, "hs.axuielement is unavailable"
+    end
+
+    local focused, focusErr = hs.axuielement.systemWideElement():attributeValue("AXFocusedUIElement")
+    if not focused then
+        return nil, "no focused UI element (" .. tostring(focusErr) .. ")"
+    end
+
+    local range, rangeErr = focused:attributeValue("AXTextInputMarkedRange")
+    if type(range) == "number" then
+        return range
+    end
+    if type(range) ~= "table" then
+        return nil, "AXTextInputMarkedRange unavailable (" .. tostring(rangeErr) .. ")"
+    end
+
+    local length = range.length
+    if type(length) ~= "number" then
+        length = range[2]
+    end
+    if type(length) ~= "number" then
+        return nil, "unexpected AXTextInputMarkedRange value: " .. hs.inspect(range)
+    end
+
+    return length
+end
+
+--- Cancels any pending restore, whether it is still in its delay or waiting for
+--- the IME to finish committing.
+local function cancelPendingRestore()
+    if restoreTimer then
+        restoreTimer:stop()
+        restoreTimer = nil
+    end
+    if commitTimer then
+        commitTimer:stop()
+        commitTimer = nil
+    end
+    commitWaitStart = nil
+    commitWaitLogged = false
+end
+
+--- Switches back to the saved input method and ends monitoring.
+local function finishRestore(reason)
+    logger.i("Switching back to previous IME (" .. reason .. ")")
+    switchBackToPreviousIME()
+    stopMicMonitoring()
+end
+
+--- Checks whether the voice IME is still committing text and either keeps
+--- waiting or finishes the restore.
+local function checkCommitState()
+    local length, reason = readMarkedRangeLength()
+
+    if length == nil then
+        -- Unverifiable in this app/window: wait longer than the usual restore
+        -- delay, and say why, since the IME may still be committing.
+        logger.w("Cannot verify IME commit state (" .. reason .. "); switching back in "
+            .. obj.commitUnreadableDelay .. "s")
+        commitTimer = hs.timer.doAfter(obj.commitUnreadableDelay, function()
+            commitTimer = nil
+            if state == "MONITORING" then
+                finishRestore("commit state unverifiable")
+            end
+        end)
+        return
+    end
+
+    if length > 0 then
+        if not commitWaitLogged then
+            commitWaitLogged = true
+            logger.i("IME still has uncommitted text (" .. length .. " chars), waiting up to "
+                .. obj.commitWaitTimeout .. "s before switching back")
+        else
+            logger.d("IME still has uncommitted text (" .. length .. " chars)")
+        end
+
+        if hs.timer.secondsSinceEpoch() - commitWaitStart >= obj.commitWaitTimeout then
+            logger.w("IME still has uncommitted text after " .. obj.commitWaitTimeout
+                .. "s; switching back anyway")
+            finishRestore("commit wait timeout")
+            return
+        end
+
+        commitTimer = hs.timer.doAfter(obj.commitCheckInterval, function()
+            commitTimer = nil
+            if state == "MONITORING" then
+                checkCommitState()
+            end
+        end)
+        return
+    end
+
+    finishRestore("no uncommitted text")
+end
+
+--- Schedules the restore that follows a microphone release, if none is pending.
+local function scheduleRestore(source)
+    if restoreTimer or commitTimer then
+        return
+    end
+
+    logger.i("Microphone is no longer in use (" .. source .. "), scheduling restore")
+
+    restoreTimer = hs.timer.doAfter(obj.restoreDelay, function()
+        restoreTimer = nil
+        if state ~= "MONITORING" then return end
+
+        if not obj.waitForCommit then
+            finishRestore("commit check disabled")
+            return
+        end
+
+        commitWaitStart = hs.timer.secondsSinceEpoch()
+        commitWaitLogged = false
+        checkCommitState()
+    end)
+end
+
 --- Sets up the audio device watcher for the MONITORING state.
 --- In this state, we're waiting for the mic to become "not in use".
 local function setupWatcherForMonitoring()
@@ -249,28 +450,12 @@ local function setupWatcherForMonitoring()
             logger.d("Device 'gone' event: in-use status changed")
             local inUse = micDevice and micDevice:inUse()
             if inUse == false then
-                logger.i("Microphone is no longer in use, scheduling restore")
-
-                -- Cancel any existing restore timer
-                if restoreTimer then
-                    restoreTimer:stop()
-                    restoreTimer = nil
-                end
-
-                -- Schedule restore after a delay
-                restoreTimer = hs.timer.doAfter(obj.restoreDelay, function()
-                    if state == "MONITORING" then
-                        logger.i("Restore delay elapsed, switching back")
-                        switchBackToPreviousIME()
-                        stopMicMonitoring()
-                    end
-                end)
+                scheduleRestore("watcher")
             elseif inUse == true then
                 -- Mic became "in use" again, cancel any pending restore
-                if restoreTimer then
+                if restoreTimer or commitTimer then
                     logger.d("Mic became in use again, cancelling restore")
-                    restoreTimer:stop()
-                    restoreTimer = nil
+                    cancelPendingRestore()
                 end
             end
         end
@@ -307,24 +492,14 @@ local function transitionToMonitoring()
         if micDevice then
             local inUse = micDevice:inUse()
             if inUse == false then
-                -- Mic is not in use, schedule restore if not already pending
-                if not restoreTimer then
-                    logger.i("Mic not in use (poll), scheduling restore")
-                    restoreTimer = hs.timer.doAfter(obj.restoreDelay, function()
-                        if state == "MONITORING" then
-                            logger.i("Restore delay elapsed (poll), switching back")
-                            switchBackToPreviousIME()
-                            stopMicMonitoring()
-                        end
-                    end)
-                end
+                -- Mic is not in use; schedule the restore unless one is pending
+                scheduleRestore("poll")
             elseif inUse == true then
                 -- Mic is in use again, cancel any pending restore
-                -- (catches both watcher-scheduled and poll-scheduled timers)
-                if restoreTimer then
+                -- (catches both watcher-scheduled and poll-scheduled waits)
+                if restoreTimer or commitTimer then
                     logger.d("Mic in use again (poll), cancelling restore")
-                    restoreTimer:stop()
-                    restoreTimer = nil
+                    cancelPendingRestore()
                 end
             end
         end
@@ -455,6 +630,12 @@ end
 --- This registers a callback for `hs.keycodes.inputSourceChanged`. Note that
 --- only one callback can be registered at a time; if you have other Spoons or
 --- code using this callback, they may conflict.
+---
+--- The commit wait before switching back reads accessibility attributes, so
+--- Hammerspoon needs the Accessibility permission (System Settings > Privacy
+--- & Security > Accessibility > Hammerspoon). Without it that state cannot be
+--- verified, and the Spoon falls back to `commitUnreadableDelay` with a
+--- warning in the log.
 ---
 --- Parameters:
 ---  * None
@@ -607,6 +788,10 @@ end
 --- Method
 --- Manually triggers a restore to the previously saved input method.
 --- This is useful for testing or for binding to a hotkey.
+---
+--- Unlike the automatic restore, this switches immediately: it does not wait
+--- for the voice IME to finish committing its text, because the user is
+--- explicitly asking for the switch now.
 ---
 --- Parameters:
 ---  * None

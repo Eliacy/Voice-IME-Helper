@@ -14,7 +14,8 @@ Hammerspoon Spoon 插件：在语音输入法使用完成后，自动切换回�
 
 1. **监听输入法切换**：通过 `hs.keycodes.inputSourceChanged` 监听系统输入法变化
 2. **检测语音输入法启动**：当输入法切换后，延迟一段时间检查麦克风状态。如果麦克风从"未使用"变为"正在使用"，判定为语音输入法启动
-3. **自动切回原输入法**：持续监听麦克风状态，当麦克风从"正在使用"变为"未使用"时，自动切换回之前记录的输入法
+3. **等待文字上屏完成**：麦克风从"正在使用"变为"未使用"后，读取焦点文本框的 `AXTextInputMarkedRange` 辅助功能属性（即输入法尚未上屏的"标记文本"，也就是等待选择的候选词）。只要它不为空，就继续等待（最长 `commitWaitTimeout` 秒），避免在语音输入法仍在整理文字时就切走输入法，导致还没上屏的内容丢失
+4. **自动切回原输入法**：确认没有未上屏内容（或等待超时）后，自动切换回之前记录的输入法
 
 ## 安装
 
@@ -65,10 +66,26 @@ spoon.VoiceIMEHelper.checkInterval = 0.3
 -- 默认 3.0 秒，超时后取消检测
 spoon.VoiceIMEHelper.checkTimeout = 3.0
 
-```lua
 -- 麦克风停止使用后，延迟多久切换回原输入法（秒）
 -- 默认 1.0 秒，防止语音输入法短暂停顿导致过早切换
 spoon.VoiceIMEHelper.restoreDelay = 1.0
+
+-- 是否等待语音输入法把文字上屏完成后再切回原输入法
+-- 默认 true。切走输入法会丢掉还没上屏的候选文本，所以默认要等
+spoon.VoiceIMEHelper.waitForCommit = true
+
+-- 等待上屏期间，重新检查"未上屏文本"的间隔（秒）
+-- 默认 0.3 秒
+spoon.VoiceIMEHelper.commitCheckInterval = 0.3
+
+-- 检测到仍有未上屏文本时，最长等待多久（秒）
+-- 默认 120 秒，超时后仍会切回，并在日志中给出警告
+spoon.VoiceIMEHelper.commitWaitTimeout = 120
+
+-- 读不到"未上屏文本"状态时的等待时间（秒）
+-- 默认 7 秒，比 restoreDelay 更长：读不到并不代表没有在整理文字
+-- （某些应用不提供该辅助功能属性，或 Hammerspoon 没有辅助功能权限）
+spoon.VoiceIMEHelper.commitUnreadableDelay = 7
 
 -- 可选：通过输入法名称过滤，只在切换到特定输入法时激活
 -- 默认 nil，监听所有输入法切换
@@ -135,8 +152,33 @@ spoon.VoiceIMEHelper:start()
 
 - `hs.keycodes.inputSourceChanged` 同一时间只能注册一个回调。如果你的 Hammerspoon 配置中有其他代码使用该回调，可能会产生冲突。
 - 麦克风的"正在使用"状态是通过 `hs.audiodevice:inUse()` 检测的，它反映的是系统级别的音频设备占用状态。
+- 判断"文字是否已经上屏"使用的是 macOS 辅助功能接口（`AXTextInputMarkedRange`），因此需要在 系统设置 → 隐私与安全性 → 辅助功能 中勾选 Hammerspoon。如果缺少该权限，或者当前应用不提供这个属性，就无法判断，此时会按 `commitUnreadableDelay`（默认 7 秒）等待后切回，并在日志中给出警告，而不是当成"已经上屏"直接切走。
+- `:triggerManualRestore()`（含快捷键触发）不会等待上屏完成，会立即切回，因为这是用户明确要求的操作。
 - 如果语音输入法没有触发输入法切换事件（例如使用全局快捷键直接在当前输入法内启动语音输入），本插件无法自动检测。此时可以使用 `:triggerManualRestore()` 手动恢复。
 - 某些语音输入法可能不切换输入法，而是在当前输入法内直接启动语音输入。这种情况下，Spoon 可能无法正常工作。
+
+## 版本更新记录
+
+版本号记录在 `VoiceIMEHelper.spoon/init.lua` 的 `VoiceIMEHelper.version`，日期为发布当天。
+
+### 1.1.0（2026-09-13）
+
+**新增：切回原输入法前，先等语音输入法把文字上屏完成**
+
+- 麦克风停止使用后不再直接切回，而是先读取焦点文本框的 `AXTextInputMarkedRange` 辅助功能属性（尚未上屏的"标记文本"，也就是等待选择的候选词）
+- 分三种情况处理：仍有未上屏文本 → 继续等待，最长等 `commitWaitTimeout`（默认 120 秒），超时后仍会切回并给出警告；没有未上屏文本 → 直接切回；读不到该状态（应用未提供该属性，或 Hammerspoon 没有辅助功能权限）→ 等 `commitUnreadableDelay`（默认 7 秒）后切回并给出警告，不会当成"没有未上屏文本"
+- 新增配置项：`waitForCommit`、`commitCheckInterval`、`commitWaitTimeout`、`commitUnreadableDelay`
+- 麦克风事件监听与轮询合并为一套"安排恢复 / 取消恢复"逻辑；等待期间麦克风再次被占用会取消本次恢复，下次释放时重新计时
+- 无论是否有未上屏文本，从发现麦克风释放到实际切换输入法，都至少经过 `restoreDelay`
+- `:triggerManualRestore()` 与 `restore` 快捷键不等待上屏，立即切回
+
+### 1.0.0（2026-08-09）
+
+**首个版本**
+
+- 通过 `hs.keycodes.inputSourceChanged` 监听输入法切换，结合麦克风使用状态判断语音输入法（如豆包）是否启动；麦克风从"正在使用"变为"未使用"后，自动切换回原先记录的输入法
+- 配置项：`checkDelay`、`checkInterval`、`checkTimeout`、`restoreDelay`、`voiceIMEPatterns`、`logLevel`；提供 `:triggerManualRestore()` 手动恢复和 `:bindHotkeys()` 快捷键绑定
+- 此后到 1.1.0 之间还有两次未单独发布版本号的改动：修正若干常见失效情况并完善使用说明；改为按不同应用分别记录原始输入法选择，使运行更稳定
 
 ## License
 
