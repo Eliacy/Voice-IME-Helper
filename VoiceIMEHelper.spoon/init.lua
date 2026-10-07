@@ -34,17 +34,27 @@
 --- that text is still being committed can discard the part that has not been
 --- committed yet, which is what this wait prevents.
 ---
---- Before switching back, the Spoon reads the focused text view's
---- `AXTextInputMarkedRange` accessibility attribute, which reports the IME's
---- uncommitted (marked/pre-edit) text, i.e. candidates waiting to be committed:
+--- Before switching back, the Spoon checks two things:
 ---
---- * readable and `length > 0` - the IME is still committing; keep waiting (up
----   to `commitWaitTimeout` seconds), then switch anyway with a warning
---- * readable and `length == 0` - nothing pending; switch back immediately
---- * unreadable (the application does not expose the attribute, or Hammerspoon
----   has no Accessibility permission) - the state cannot be verified, so wait
----   `commitUnreadableDelay` seconds (longer than `restoreDelay`) before
----   switching, and log a warning that names the reason
+--- 1. The focused text view's `AXTextInputMarkedRange` accessibility attribute,
+---    which reports the IME's uncommitted (marked/pre-edit) text, i.e.
+---    candidates waiting to be committed. Applications built on AppKit text
+---    views provide it; Chrome/Electron do not.
+--- 2. The voice IME's own panel/window. A voice IME keeps a status panel on
+---    screen while it records and while it is still processing the recording
+---    (Doubao shows `识别优化中`), and hides it once the text is final. The
+---    panel belongs to the IME process, so this works even where (1) does not,
+---    which makes it the only reliable signal in Chrome/Electron.
+---
+--- While either signal says the IME is busy, the Spoon keeps waiting (up to
+--- `commitWaitTimeout` seconds) and then switches anyway with a warning. When
+--- neither can be read (no Accessibility permission, or an IME that exposes
+--- nothing), the state cannot be verified: it waits `commitUnreadableDelay`
+--- seconds (longer than `restoreDelay`) and logs a warning naming the reason,
+--- instead of assuming the text is done.
+---
+--- Set `waitForIMEIdle = false` to ignore the panel signal and rely on the
+--- marked range alone.
 ---
 --- ### Configuration
 ---
@@ -56,6 +66,7 @@
 --- spoon.VoiceIMEHelper.checkTimeout = 3.0        -- Timeout for mic detection (seconds)
 --- spoon.VoiceIMEHelper.restoreDelay = 1.0        -- Delay before switching back (seconds)
 --- spoon.VoiceIMEHelper.waitForCommit = true      -- Wait for IME text to be committed
+--- spoon.VoiceIMEHelper.waitForIMEIdle = true     -- Also watch the IME's own panel
 --- spoon.VoiceIMEHelper.commitCheckInterval = 0.3 -- Re-check interval while committing
 --- spoon.VoiceIMEHelper.commitWaitTimeout = 120   -- Max seconds to wait while committing
 --- spoon.VoiceIMEHelper.commitUnreadableDelay = 7 -- Seconds to wait when unreadable
@@ -73,7 +84,7 @@ obj.name = "VoiceIMEHelper"
 --- VoiceIMEHelper.version
 --- Variable
 --- The version of the Spoon.
-obj.version = "1.1.0"
+obj.version = "1.2.0"
 
 --- VoiceIMEHelper.author
 --- Variable
@@ -154,6 +165,17 @@ obj.commitWaitTimeout = 120
 --- committing; a warning naming the reason is logged.
 --- Default: `7`
 obj.commitUnreadableDelay = 7
+
+--- VoiceIMEHelper.waitForIMEIdle
+--- Variable
+--- Whether to also watch the voice IME's own panel/window as a busy signal.
+--- Voice IMEs (e.g. Doubao/豆包) keep a small status panel on screen while they
+--- record and while they are still processing the recording, and hide it once
+--- the text is final. That panel belongs to the IME process, so this works even
+--- in applications that do not expose `AXTextInputMarkedRange` (Chrome,
+--- Electron), where it is the only reliable signal available.
+--- Default: `true`
+obj.waitForIMEIdle = true
 
 --- VoiceIMEHelper.voiceIMEPatterns
 --- Variable
@@ -356,15 +378,116 @@ local function finishRestore(reason)
     stopMicMonitoring()
 end
 
+--- Whether accessibility queries are answering at all.
+---
+--- An application that simply does not implement a given attribute still
+--- answers `AXRole`; a missing Accessibility permission does not. That is what
+--- separates "this app has no marked range" (Chrome) from "we cannot read
+--- anything" (permission problem).
+local function axIsUsable()
+    if not hs.axuielement then
+        return false
+    end
+    local focused = hs.axuielement.systemWideElement():attributeValue("AXFocusedUIElement")
+    if not focused then
+        return false
+    end
+    return focused:attributeValue("AXRole") ~= nil
+end
+
+--- Tells whether the input method we are switching away from is still busy, by
+--- looking for a visible panel/window of its own process.
+---
+--- This is what makes the wait work in applications that do not expose
+--- `AXTextInputMarkedRange` (Chrome/Electron): the voice IME keeps a status
+--- panel on screen while it records and while it is still processing the
+--- recording, and hides it once the text is final.
+---
+--- Returns:
+---  * `true` if the IME has a visible window, `false` if its process is running
+---    and has no visible window, or
+---  * `nil` plus a string describing why this could not be determined
+local function imeIsBusy()
+    if not (hs.application and hs.application.applicationsForBundleID) then
+        return nil, "hs.application.applicationsForBundleID is unavailable"
+    end
+
+    local sourceID = hs.keycodes.currentSourceID()
+    if not sourceID then
+        return nil, "no current input source"
+    end
+
+    if not axIsUsable() then
+        return nil, "accessibility queries are not answering (permission?)"
+    end
+
+    -- Source ids carry a mode suffix, e.g.
+    -- com.bytedance.inputmethod.doubaoime.pinyin -> com.bytedance.inputmethod.doubaoime
+    local parts = {}
+    for part in sourceID:gmatch("[^.]+") do parts[#parts + 1] = part end
+
+    for cut = #parts, 2, -1 do
+        local apps = hs.application.applicationsForBundleID(table.concat(parts, ".", 1, cut))
+        if #apps > 0 then
+            local windows = 0
+            for _, app in ipairs(apps) do
+                local ok, appWindows = pcall(function() return app:allWindows() end)
+                if not ok then
+                    return nil, "cannot list the IME's windows"
+                end
+                for _, w in ipairs(appWindows) do
+                    windows = windows + 1
+                    if w:isVisible() then
+                        return true, "panel visible (" .. windows .. " window(s))"
+                    end
+                end
+            end
+            return false, windows .. " window(s), none visible"
+        end
+    end
+
+    -- The IME process is not running (or not enumerable): we cannot tell what
+    -- it is doing, so report that rather than assuming it is finished.
+    return nil, "no running process for " .. sourceID
+end
+
+--- Decides whether the voice IME still has text to commit.
+---
+--- Returns:
+---  * `busy` - true when the IME still has work to do
+---  * `why`  - a string describing what was observed (for the log)
+---  * `unverifiable` - true when neither the text view nor the IME could be read
+local function pendingTextState()
+    local markedLength, markedReason = readMarkedRangeLength()
+    if markedLength and markedLength > 0 then
+        return true, markedLength .. " characters of uncommitted text", false
+    end
+
+    local imeBusy, imeReason
+    if obj.waitForIMEIdle then
+        imeBusy, imeReason = imeIsBusy()
+    end
+
+    if imeBusy == true then
+        return true, "the IME is still showing its own panel", false
+    end
+    if markedLength == nil and imeBusy == nil then
+        return false, "marked range: " .. tostring(markedReason)
+            .. "; IME: " .. tostring(imeReason), true
+    end
+    return false, "marked range " .. tostring(markedLength)
+        .. "; IME " .. tostring(imeReason), false
+end
+
 --- Checks whether the voice IME is still committing text and either keeps
 --- waiting or finishes the restore.
 local function checkCommitState()
-    local length, reason = readMarkedRangeLength()
+    local busy, why, unverifiable = pendingTextState()
 
-    if length == nil then
-        -- Unverifiable in this app/window: wait longer than the usual restore
-        -- delay, and say why, since the IME may still be committing.
-        logger.w("Cannot verify IME commit state (" .. reason .. "); switching back in "
+    if unverifiable then
+        -- Neither the text view nor the IME process can tell us anything: wait
+        -- longer than usual, and say so, instead of assuming the text is done.
+        logger.w("Cannot verify IME commit state (" .. why .. "); switching back in "
             .. obj.commitUnreadableDelay .. "s")
         commitTimer = hs.timer.doAfter(obj.commitUnreadableDelay, function()
             commitTimer = nil
@@ -375,18 +498,18 @@ local function checkCommitState()
         return
     end
 
-    if length > 0 then
+    if busy then
         if not commitWaitLogged then
             commitWaitLogged = true
-            logger.i("IME still has uncommitted text (" .. length .. " chars), waiting up to "
+            logger.i("Voice IME still busy (" .. why .. "), waiting up to "
                 .. obj.commitWaitTimeout .. "s before switching back")
         else
-            logger.d("IME still has uncommitted text (" .. length .. " chars)")
+            logger.d("Voice IME still busy (" .. why .. ")")
         end
 
         if hs.timer.secondsSinceEpoch() - commitWaitStart >= obj.commitWaitTimeout then
-            logger.w("IME still has uncommitted text after " .. obj.commitWaitTimeout
-                .. "s; switching back anyway")
+            logger.w("Voice IME still busy after " .. obj.commitWaitTimeout
+                .. "s (" .. why .. "); switching back anyway")
             finishRestore("commit wait timeout")
             return
         end
@@ -400,7 +523,8 @@ local function checkCommitState()
         return
     end
 
-    finishRestore("no uncommitted text")
+    logger.d("No pending IME text (" .. why .. ")")
+    finishRestore("no pending text")
 end
 
 --- Schedules the restore that follows a microphone release, if none is pending.
